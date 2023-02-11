@@ -33,6 +33,8 @@ dependencies {
   implementation 'org.apache.logging.log4j:log4j-api'
   implementation 'org.apache.logging.log4j:log4j-core'
   implementation 'com.google.api-client:google-api-client'
+  implementation 'com.damnhandy:handy-uri-templates:2.1.7'
+  implementation 'net.lingala.zip4j:zip4j:2.11.4'
 
   testRuntimeOnly 'xerces:xercesImpl'
   testImplementation 'org.junit.jupiter:junit-jupiter-api'

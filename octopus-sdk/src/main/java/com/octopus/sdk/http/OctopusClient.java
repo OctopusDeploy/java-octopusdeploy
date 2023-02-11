@@ -17,30 +17,27 @@ package com.octopus.sdk.http;
 
 import static java.util.Collections.singletonList;
 
+import com.octopus.sdk.Constants;
+import com.octopus.sdk.ServerInformation;
 import com.octopus.sdk.exceptions.OctopusRequestException;
-import com.octopus.sdk.exceptions.OctopusServerException;
-import com.octopus.sdk.model.ErrorResponse;
-import com.octopus.sdk.model.RootDocument;
-import com.octopus.sdk.model.login.LoginBody;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.time.OffsetDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-import com.google.common.base.Preconditions;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonSyntaxException;
+import com.octopus.sdk.logging.Logger;
+import com.octopus.sdk.resolver.Resolver;
+import com.octopus.sdk.resolver.SpaceResolver;
 import okhttp3.Call;
-import okhttp3.CookieJar;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
@@ -49,11 +46,9 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import org.jetbrains.annotations.Nullable;
 
 public class OctopusClient {
-  private static final Logger LOG = LogManager.getLogger();
   private static final String ROOT_PATH = "api";
 
   private final OkHttpClient httpClient;
@@ -61,24 +56,34 @@ public class OctopusClient {
   private final URL serverUrl;
   private final Map<String, List<String>> requiredHeaders = new HashMap<>();
 
-  public OctopusClient(final OkHttpClient httpClient, final URL serverUrl) {
+  private final Logger logger;
+
+  private final Resolver resolver;
+  public final SpaceResolver spaceResolver;
+  @Nullable
+  private ServerInformation serverInformation;
+
+  OctopusClient(final OkHttpClient httpClient, final URL serverUrl, final Logger logger) {
     this.httpClient = httpClient;
     this.serverUrl = serverUrl;
     requiredHeaders.put("Content-Type", singletonList("application/json"));
     requiredHeaders.put("Accept-encoding", singletonList("application/json"));
 
-    this.gson =
-        new GsonBuilder()
-            .registerTypeAdapter(
-                OffsetDateTime.class, new GsonTypeConverters.OffsetDateTimeDeserializer())
-            .registerTypeAdapter(
-                OffsetDateTime.class, new GsonTypeConverters.OffsetDateTimeSerializer())
-            .disableHtmlEscaping()
-            .create();
+    this.gson = new GsonBuilder()
+        .registerTypeAdapter(
+            OffsetDateTime.class, new GsonTypeConverters.OffsetDateTimeDeserializer())
+        .registerTypeAdapter(
+            OffsetDateTime.class, new GsonTypeConverters.OffsetDateTimeSerializer())
+        .disableHtmlEscaping()
+        .create();
+
+    this.logger = logger;
+    this.resolver = new Resolver(serverUrl.toString());
+    this.spaceResolver = new SpaceResolver();
   }
 
-  public OctopusClient(final OkHttpClient httpClient, final URL serverUrl, final String apiKey) {
-    this(httpClient, serverUrl);
+  OctopusClient(final OkHttpClient httpClient, final URL serverUrl, final String apiKey, final Logger logger) {
+    this(httpClient, serverUrl, logger);
     requiredHeaders.put("X-Octopus-ApiKey", singletonList(apiKey));
   }
 
@@ -86,38 +91,82 @@ public class OctopusClient {
     return serverUrl;
   }
 
-  public RootDocument getRootDocument() {
-    try {
-      return get(RequestEndpoint.fromPath(ROOT_PATH), RootDocument.class);
-    } catch (final IOException e) {
-      throw new UncheckedIOException(e.getMessage(), e);
-    }
-  }
+  // TODO: Get Capabilities
 
-  public <T> T get(final RequestEndpoint endpoint, final Class<T> responseType) throws IOException {
-    final Call call = createCall(endpoint, "GET", null);
+  public <TResource> TResource get(final String path, @Nullable Map<String, Object> args, final Class<TResource> responseType) throws IOException {
+    if (path == null) {
+      throw new Error("path parameter was not set");
+    }
+
+    final String url = this.resolveUrl(path, args);
+    final Call call = this.createCall(url, "GET", null);
+
     return executeCall(call, responseType);
   }
 
-  public <T, U> U post(
-      final RequestEndpoint endpoint, final T bodyObject, final Class<U> responseType)
+  public <TBody, TResource> TResource post(
+      final String endpoint, final TBody bodyObject, final Class<TResource> responseType)
       throws IOException {
     final Call call = createCallWithJsonBody(endpoint, "POST", bodyObject);
     return executeCall(call, responseType);
   }
 
-  public <U> U postStream(
-      final RequestEndpoint endpoint, final File file, final Class<U> responseType)
-      throws IOException {
-    final RequestBody streamingBody =
-        RequestBody.create(file, MediaType.parse("application/octet-stream"));
-    final MultipartBody multipartBody =
-        new MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("file", file.getName(), streamingBody)
-            .build();
 
-    final Call call = createCall(endpoint, "POST", multipartBody);
+  public <TReturn> TReturn doCreate(String path, @Nullable Object command, @Nullable Map<String, Object> args, final Class<TReturn> responseType) throws IOException {
+    return this.doCommand("POST", path, command, args, responseType);
+  }
+
+  public <TReturn> TReturn doUpdate(String path, @Nullable Object command, @Nullable Map<String, Object> args, final Class<TReturn> responseType) throws IOException {
+    return this.doCommand("PUT", path, command, args, responseType);
+  }
+
+  private <TReturn> TReturn doCommand(String verb, String path, @Nullable Object command, @Nullable Map<String, Object> args, final Class<TReturn> responseType) throws IOException {
+    Map<String, Object> req = this.convertObjToMap(command);
+    if (req.containsKey("spaceName")) {
+      final String spaceName = (String) req.get("spaceName");
+      final String spaceId = spaceResolver.resolveSpaceId(this, spaceName);
+      args.put("spaceId", spaceId);
+      req.put("spaceId", spaceId);
+    }
+
+    if (args != null && args.containsValue("spaceName")) {
+      final String spaceId = spaceResolver.resolveSpaceId(this, (String) args.get("spaceName"));
+      args.put("spaceId", spaceId);
+    }
+
+    final String url = this.resolveUrl(path, args);
+    final Call call = this.createCallWithJsonBody(url, verb, command);
+    return executeCall(call, responseType);
+  }
+
+  public <TReturn> TReturn request(String path, @Nullable Object request, Class<TReturn> responseType) throws IOException {
+    Map<String, Object> req = null;
+    if (request != null) {
+      req = this.convertObjToMap(request);
+    }
+    return this.request(path, req, responseType);
+  }
+  public <TReturn> TReturn request(String path, @Nullable Map<String, Object> request, Class<TReturn> responseType) throws IOException {
+    if (request != null && request.containsKey("spaceName")) {
+      final String spaceName = (String) request.get("spaceName");
+      final String spaceId = spaceResolver.resolveSpaceId(this, spaceName);
+      request.put("spaceId", spaceId);
+    }
+    final String url = this.resolveUrl(path, request);
+    final Call call = this.createCallWithJsonBody(url, "GET", responseType);
+    return executeCall(call, responseType);
+  }
+
+  public <U> U postStream(
+      final String path, final File file, Map<String, Object> args, final Class<U> responseType)
+      throws IOException {
+    final RequestBody streamingBody = RequestBody.create(file, MediaType.parse("application/octet-stream"));
+    final MultipartBody multipartBody = new MultipartBody.Builder()
+        .setType(MultipartBody.FORM)
+        .addFormDataPart("file", file.getName(), streamingBody)
+        .build();
+    final String url = this.resolveUrl(path, args);
+    final Call call = createCall(url, "POST", multipartBody);
     return executeCall(call, responseType);
   }
 
@@ -128,7 +177,16 @@ public class OctopusClient {
     return executeCall(call, responseType);
   }
 
-  public void delete(final RequestEndpoint endpoint) throws IOException {
+  public void delete(final String path) throws IOException {
+    delete(path, null);
+  }
+
+  public void delete(final String path, @Nullable Map<String, Object> args) throws IOException {
+    if (args != null && args.containsKey("spaceName")) {
+      String spaceId = spaceResolver.resolveSpaceId(this, (String) args.get("spaceName"));
+      args.put("spaceId", spaceId);
+    }
+    String endpoint = resolveUrl(path, args);
     final Call call = createCall(endpoint, "DELETE", null);
     executeCall(call, Void.class);
   }
@@ -144,7 +202,8 @@ public class OctopusClient {
         .getQueryParameters()
         .forEach((k, v) -> v.forEach(i -> builder.addQueryParameter(k, i)));
 
-    // There MAY be a double "/" in the URL (which is legal, but may cause issues with some
+    // There MAY be a double "/" in the URL (which is legal, but may cause issues
+    // with some
     // frameworks)
     return builder.build().url().toString().replace("//", "/");
   }
@@ -159,13 +218,40 @@ public class OctopusClient {
     return createCall(endpoint, method, body);
   }
 
-  private Call createCall(
-      final RequestEndpoint endpoint, final String method, final RequestBody body) {
+  public ServerInformation getServerInformation() throws IOException {
+    if (this.serverInformation == null) {
+      final RootResource rootDocument = this.get(Constants.apiLocation, null, RootResource.class);
+      if (rootDocument == null || rootDocument.Version == null) {
+        throw new Error("he Octopus server information could not be retrieved. Please check the configured URL.");
+      }
+      this.serverInformation = new ServerInformation();
+      this.serverInformation.version = rootDocument.Version;
+      this.serverInformation.installationId = rootDocument.InstallationId;
+    }
+    return this.serverInformation;
+  }
+
+  private <T> Call createCallWithJsonBody(
+          final String endpoint, final String method, final T bodyObject) {
+
+    RequestBody body = null;
+    if (bodyObject != null) {
+      body = RequestBody.create(MediaType.parse("application/json"), gson.toJson(bodyObject));
+    }
+    return createCall(endpoint, method, body);
+  }
+  private Call createCall(final RequestEndpoint endpoint, final String method, final RequestBody body) {
     final String url = generateUrl(endpoint);
     final Request.Builder builder = new Request.Builder().method(method, body).url(url);
     requiredHeaders.forEach(
-        (headerName, items) ->
-            items.forEach(headerVal -> builder.addHeader(headerName, headerVal)));
+        (headerName, items) -> items.forEach(headerVal -> builder.addHeader(headerName, headerVal)));
+    return httpClient.newCall(builder.build());
+  }
+
+  private Call createCall(final String url, final String method, final RequestBody body) {
+    final Request.Builder builder = new Request.Builder().method(method, body).url(url);
+    requiredHeaders.forEach(
+            (headerName, items) -> items.forEach(headerVal -> builder.addHeader(headerName, headerVal)));
     return httpClient.newCall(builder.build());
   }
 
@@ -181,79 +267,58 @@ public class OctopusClient {
         try {
           return gson.fromJson(responseBody, responseType);
         } catch (final JsonSyntaxException e) {
-          LOG.error(
-              "Failed to decode the response body '{}' as a {}",
-              responseBody,
-              responseType.getSimpleName());
+          this.error(
+                  String.format("Failed to decode the response body '%s' as a %s",
+                          responseBody.toString(),
+                          responseType.getSimpleName()),
+                  null);
           throw e;
         }
       } else {
         throw constructException(response.code(), responseBody);
       }
     } catch (final UnknownHostException e) {
-      LOG.error("Failed to connect to Octopus Server at {}", call.request().url());
+      this.error(String.format("Failed to connect to Octopus Server at %s", call.request().url().toString()), null);
       throw e;
     }
   }
 
-  public void login(final String username, final String password) throws IOException {
-    Preconditions.checkArgument(
-        httpClient.cookieJar() != CookieJar.NO_COOKIES,
-        "Cannot login without a client side cookie jar");
-    final LoginBody login = new LoginBody(username, password);
-    final String loginPath = getRootDocument().getSignInLink();
-
-    final Call loginCall =
-        createCallWithJsonBody(RequestEndpoint.fromPath(loginPath), "POST", login);
-    try (final Response response = loginCall.execute()) {
-      if (response.isSuccessful()) {
-        final String csrfCookieContent = response.headers("Set-Cookie").get(1);
-        final String csrfToken = getCsrfTokenFromCookies(csrfCookieContent);
-        requiredHeaders.put("X-Octopus-Csrf-Token", singletonList(csrfToken));
-      } else {
-        LOG.error("Failed to login to {}", serverUrl);
-        final String responseBody = response.body().string();
-        final ErrorResponse errorResponse = gson.fromJson(responseBody, ErrorResponse.class);
-        throw new OctopusServerException(response.code(), errorResponse);
-      }
-    } catch (final UnknownHostException e) {
-      LOG.error("Failed to connect to Octopus Server at {}", loginCall.request().url());
-      throw e;
-    }
-  }
-
-  public boolean supportsSpaces() {
-    return getRootDocument().getSpacesLink() != null;
-  }
-
-  // The 'accounts' link is only valid within a space, and thus will only be non-null in the rootDoc
-  // if a default
-  // space is enabled (OR OctopusServer is a pre-space version).
-  public boolean defaultSpaceAvailable() {
-    return getRootDocument().getAccountsLink() != null;
-  }
-
-  public static String getCsrfTokenFromCookies(final String csrfCookieContent) {
-    try {
-      final Pattern splittingRegex = Pattern.compile("^.*?=([^;]*).*");
-      final Matcher matcher = splittingRegex.matcher(csrfCookieContent);
-      if (!matcher.matches()) {
-        throw new IllegalArgumentException(
-            "Response did not contain expected content for CSRF cookie - " + csrfCookieContent);
-      }
-      return matcher.group(1);
-    } catch (final Exception e) {
-      LOG.error("Failed to extract csrf token from '{}'", csrfCookieContent);
-      throw e;
-    }
+  String resolveUrl(String path, @Nullable Map<String, Object> args) {
+    return this.resolver.resolve(path, args);
   }
 
   private OctopusRequestException constructException(final int code, final String responseBody) {
-    try {
-      final ErrorResponse errorResponse = gson.fromJson(responseBody, ErrorResponse.class);
-      return new OctopusServerException(code, errorResponse);
-    } catch (final JsonSyntaxException e) {
-      return new OctopusRequestException(code, responseBody);
+    return new OctopusRequestException(code, responseBody);
+  }
+
+  public void info(String message) {
+      this.logger.debug(message);
+  }
+
+  public void debug(String message) {
+    this.logger.debug(message);
+  }
+
+  public void warn(String message) {
+    this.logger.warn(message);
+  }
+
+  public void error(String message, @Nullable Exception error) {
+    this.logger.error(message, error);
+  }
+
+  public Map<String, Object> convertObjToMap(Object obj) {
+    Map<String, Object> map = new HashMap<>();
+    Field[] allFields = obj.getClass().getDeclaredFields();
+    for (Field field : allFields) {
+      field.setAccessible(true);
+      try {
+        Object value = field.get(obj);
+        map.put(field.getName(), value);
+      } catch (IllegalAccessException e) {
+        this.error("Can not convert object to map", e);
+      }
     }
+    return map;
   }
 }

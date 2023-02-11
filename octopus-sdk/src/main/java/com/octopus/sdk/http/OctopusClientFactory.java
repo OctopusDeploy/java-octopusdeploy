@@ -15,17 +15,21 @@
 
 package com.octopus.sdk.http;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.URL;
 
+import com.octopus.sdk.logging.Logger;
 import okhttp3.Authenticator;
 import okhttp3.Credentials;
 import okhttp3.OkHttpClient;
+import org.jetbrains.annotations.Nullable;
 
 public class OctopusClientFactory {
 
-  public static OctopusClient createClient(final ConnectData connectData) {
+  public static OctopusClient createClient(final ConnectData connectData) throws IOException {
+
     final OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder();
 
     clientBuilder.connectTimeout(connectData.getConnectTimeout());
@@ -35,8 +39,15 @@ public class OctopusClientFactory {
     }
 
     final OkHttpClient httpClient = clientBuilder.build();
-    return new OctopusClient(
-        httpClient, connectData.getOctopusServerUrl(), connectData.getApiKey());
+
+
+
+    final OctopusClient client = new OctopusClient(
+        httpClient, connectData.getOctopusServerUrl(), connectData.getApiKey(), createDefaultLogger());
+
+    client.getServerInformation();
+
+    return client;
   }
 
   private static void addProxy(final OkHttpClient.Builder builder, final ProxyData proxyData) {
@@ -56,5 +67,22 @@ public class OctopusClientFactory {
       String credential = Credentials.basic(username, password);
       return response.request().newBuilder().header("Proxy-Authorization", credential).build();
     };
+  }
+
+  private static class DefaultLogger implements Logger {
+    @Override
+    public void info(String message) {}
+
+    @Override
+    public void debug(String message) {}
+
+    @Override
+    public void warn(String message) {}
+
+    @Override
+    public void error(String message, @Nullable Exception error) {}
+  }
+  private static Logger createDefaultLogger() {
+    return new DefaultLogger();
   }
 }
